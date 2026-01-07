@@ -1,12 +1,6 @@
 name: Build and Publish (vastai-pyserini)
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - docker/vastai-pyserini/**
-      - .github/workflows/ghcr-vastai-pyserini.yml
   workflow_dispatch:
 
 permissions:
