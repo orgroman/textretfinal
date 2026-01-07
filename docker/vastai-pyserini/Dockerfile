@@ -29,7 +29,8 @@ ENV PYSERINI_CACHE=/workspace/.cache/pyserini
 RUN mkdir -p "${PYSERINI_CACHE}"
 
 COPY start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+RUN sed -i 's/\r$//' /usr/local/bin/start.sh \
+    && chmod +x /usr/local/bin/start.sh
 
 EXPOSE 8888
 
