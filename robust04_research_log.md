@@ -18,6 +18,7 @@ Constraints:
 ## Data
 
 - **Queries**: `Files-20260104/queriesROBUST.txt` (249 queries)
+- Query text in `queriesROBUST.txt` is a **single line per qid** (effectively **title-only**). No description/narrative fields are provided in the HW data.
 - **Judged (tuning) queries**: first 50 qids (301–350)
 - **Qrels**: `Files-20260104/qrels_50_Queries`
 - **Test queries for submission**: remaining 199 qids (351–450 and 601–671, 673–700)
@@ -29,6 +30,12 @@ Constraints:
   - `beir-v1.0.0-robust04.splade-pp-ed`
   - `beir-v1.0.0-robust04.splade-v3`
   - `beir-v1.0.0-robust04.bge-base-en-v1.5.hnsw`
+
+- Additional Robust04 prebuilt indexes available in Pyserini docs (not yet evaluated here):
+  - `beir-v1.0.0-robust04.contriever`
+  - `beir-v1.0.0-robust04.contriever-msmarco`
+  - `beir-v1.0.0-robust04.bge-base-en-v1.5.flat`
+  - `beir-v1.0.0-robust04.cohere-embed-english-v3.0` (may require special query encoder)
 
 - JVM/Lucene stability:
   - We set:
@@ -67,6 +74,17 @@ We use **min-max normalization per run** and a **weighted sum**.
   - fp16: enabled
   - Best alpha (on judged queries): **0.2**
   - MAP ≈ **0.3422**
+
+- **MonoT5 passage-level reranking of fused run_3** (higher top-N, MaxP aggregation)
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 1000 (sweep: 200/300/500/800/1000)
+  - Passage splitting: doc_max_chars=12000, passage_chars=1500, stride_chars=1200, max_passages=8
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Best alpha (on judged queries): **0.3**
+  - MAP vs `top_n`: 200=0.3456, 300=0.3514, 500=0.3649, 800=0.3727, 1000=0.3743
+  - MAP ≈ **0.3743** (best so far)
+  - CHECKPOINT: improvement ≥ 0.005 over previous best; see `robust04_checkpoint_0.3743_monot5p_duqgen.ipynb`
 
 - **MonoT5 reranking of fused run_3** (top-200, light interpolation)
   - Model: `castorini/monot5-base-msmarco`
@@ -251,3 +269,8 @@ These are public models that explicitly mention Robust04 fine-tuning:
 - **2026-01-09**
   - Started literature survey: PARADE, isotropy post-processing for dense retrieval, SDM-style proximity for learned sparse retrieval.
   - Found Robust04-tuned MonoT5 3B and ColBERT models on Hugging Face.
+
+- **2026-01-10**
+  - Swept higher `monot5p-top-n` for passage-level reranking with `cramraj8/duqgen-monot5-3b-robust04-1k`.
+  - New best on judged queries: `top_n=1000`, `agg=max`, `alpha=0.3`, `fp16` → MAP ≈ **0.3743**.
+  - Checkpoint notebook: `robust04_checkpoint_0.3743_monot5p_duqgen.ipynb`
