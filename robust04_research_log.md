@@ -83,14 +83,92 @@ We use **min-max normalization per run** and a **weighted sum**.
   - fp16: enabled
   - Best alpha (on judged queries): **0.3**
   - MAP vs `top_n`: 200=0.3456, 300=0.3514, 500=0.3649, 800=0.3727, 1000=0.3743
-  - MAP ≈ **0.3743** (best so far)
+  - MAP ≈ **0.3743** (checkpoint)
   - CHECKPOINT: improvement ≥ 0.005 over previous best; see `robust04_checkpoint_0.3743_monot5p_duqgen.ipynb`
+  - Variant (no overlap): stride_chars=1500, max_passages=8, alpha=0.25 → MAP ≈ **0.3729** (close but below best)
+  - Variant (more passages): max_passages=10, stride_chars=1200, alpha=0.3 → MAP ≈ **0.3759** (best so far; not a checkpoint)
+  - Variant (more coverage): doc_max_chars=20000, max_passages=15, stride_chars=1200, alpha=0.3 → MAP ≈ **0.3767** (best so far; not a checkpoint)
+  - Variant (hybrid aggregation): doc_max_chars=20000, max_passages=15, stride_chars=1200, agg=hybrid (hybrid_lambda=0.85, avg_topk=3), alpha=0.32 → MAP ≈ **0.3774** (best so far; not a checkpoint)
+  - Variant (softmax aggregation): doc_max_chars=20000, max_passages=15, stride_chars=1200, agg=softmax (temp=1.0), alpha=0.28 → MAP ≈ **0.3722** (worse than MaxP)
 
 - **MonoT5 reranking of fused run_3** (top-200, light interpolation)
   - Model: `castorini/monot5-base-msmarco`
   - Top-N reranked: 200
   - Best alpha (on judged queries): **0.985**
   - MAP ≈ **0.3006**
+
+- **MonoT5 passage-level reranking of fused run_3 (speed-constrained)**
+  - Goal: keep total runtime under ~1 hour for ~250 queries by reducing passage compute.
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 1000
+  - Passage splitting: doc_max_chars=12000, passage_chars=1500, stride_chars=8400, max_passages=2
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.5
+  - Best: alpha=0.4 → MAP ≈ **0.3259**
+  - Runtime: ≈ **14.09 sec/query** (estimated 250 queries ≈ **58.7 min**)
+
+- **MonoT5 passage-level reranking of fused run_3 (fast-ish, strong MAP under 1h/250q)**
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 300
+  - Passage splitting: doc_max_chars=12000, passage_chars=1500, stride_chars=1200, max_passages=8
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.5
+  - Best: alpha=0.3 → MAP ≈ **0.3516**
+  - Runtime: ≈ **13.45 sec/query** (estimated 250 queries ≈ **56.1 min**)
+
+- **MonoT5 passage-level reranking of fused run_3 (adaptive passage budget, best speed/MAP so far under 1h/250q)**
+  - Idea: spend more passage compute on the top of the list and less on the tail.
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 500
+  - Head (top-100 docs): stride_chars=1200, max_passages=8
+  - Tail (next 400 docs): stride_chars=4500, max_passages=2
+  - Passage chars: 1500; doc_max_chars=12000
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.5
+  - Best: alpha=0.2 → MAP ≈ **0.3580**
+  - Runtime: ≈ **11.32 sec/query** (estimated 250 queries ≈ **47.2 min**)
+
+- **MonoT5 passage-level reranking of fused run_3 (adaptive budget, more head coverage)**
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 500
+  - Head (top-100 docs): stride_chars=1200, max_passages=10
+  - Tail (next 400 docs): stride_chars=4500, max_passages=2
+  - Passage chars: 1500; doc_max_chars=12000
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.3
+  - Best: alpha=0.3 → MAP ≈ **0.3590**
+  - Runtime: ≈ **11.46 sec/query** (estimated 250 queries ≈ **47.8 min**)
+
+- **MonoT5 passage-level reranking of fused run_3 (adaptive budget + lexical passage selection for tail)**
+  - Idea: for tail docs, generate a small set of non-overlapping passages and select the top-2 passages by lexical query-term overlap before running MonoT5.
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 500
+  - Head (top-100 docs): stride_chars=1200, max_passages=10
+  - Tail (next 400 docs):
+    - Generate candidates: stride_chars=1500, max_passages=8 (no overlap)
+    - Select: top-2 passages by query-term overlap
+  - Passage chars: 1500; doc_max_chars=12000
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.3
+  - Best: alpha=0.3 → MAP ≈ **0.3639**
+  - Runtime: ≈ **13.48 sec/query** (estimated 250 queries ≈ **56.2 min**)
+
+- **MonoT5 passage-level reranking of fused run_3 (adaptive budget, deeper rerank list)**
+  - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+  - Top-N reranked: 700
+  - Head (top-100 docs): stride_chars=1200, max_passages=8
+  - Tail (next 600 docs): stride_chars=4500, max_passages=2
+  - Passage chars: 1500; doc_max_chars=12000
+  - Aggregation: MaxP
+  - fp16: enabled
+  - Alpha sweep: 0.1–0.35
+  - Best: alpha=0.2 → MAP ≈ **0.3604**
+  - Runtime: ≈ **14.70 sec/query** (estimated 250 queries ≈ **61.2 min**; slightly above the 1-hour target in this timing)
 
 ## Methods tried that did *not* improve MAP (in our sweeps)
 
@@ -128,7 +206,59 @@ Result: **no MAP gain** over fusion baseline.
   - `cross-encoder/ms-marco-MiniLM-L-6-v2`
   - `BAAI/bge-reranker-base` (tested)
 
+- Fast rerank setting (used for both models):
+  - Baseline: fused `run_3` (min-max) candidates
+  - Rerank depth: top-200
+  - Doc text truncation: `doc_max_chars=4000`
+  - Tokenization: `max_length=256`
+  - Interpolation: alpha sweep (combine baseline score + reranker score)
+
+- Observed results (50 judged queries):
+  - `cross-encoder/ms-marco-MiniLM-L-6-v2`
+    - Best alpha: 0.9
+    - MAP ≈ **0.2951** (baseline fusion MAP=0.2997)
+    - Runtime: ≈ **0.45 sec/query** (199 queries ≈ 1.5 min)
+  - `BAAI/bge-reranker-base`
+    - Best alpha: 0.98
+    - MAP ≈ **0.2966** (baseline fusion MAP=0.2997)
+    - Runtime: ≈ **0.45 sec/query** (199 queries ≈ 1.5 min)
+
 Result: **no MAP gain** over fusion baseline.
+
+### 2-stage prune + heavy reranker (BGE prune → MonoT5-3B passage rerank)
+
+- Motivation: keep the strong MonoT5 passage reranker but reduce total compute by only running it on a smaller candidate set.
+
+- Setup:
+  - Baseline candidates: fused `run_3` (min-max) depth=1000
+  - Prune stage:
+    - Model: `BAAI/bge-reranker-base`
+    - Score top-500 docs and keep top-200
+    - `doc_max_chars=4000`, `max_length=256`
+  - Heavy stage:
+    - Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+    - Passage rerank top-200 (selected by prune)
+    - `doc_max_chars=12000`, `passage_chars=1500`, `stride_chars=1200`, `max_passages=8`
+    - Aggregation: MaxP
+    - Alpha: 0.3
+
+- Observed result (50 judged queries):
+  - MAP ≈ **0.2811** (baseline fusion MAP=0.2997)
+  - Runtime: ≈ **14.53 sec/query** (199 queries ≈ 48.2 min)
+
+Conclusion: the prune stage is **not recall-safe** in this setting and removes documents that MonoT5 would have promoted; overall MAP drops.
+
+### MonoT5 passage-level reranking (AvgTopK aggregation)
+
+- Model: `cramraj8/duqgen-monot5-3b-robust04-1k`
+- Top-N reranked: 1000
+- Passage splitting: doc_max_chars=12000, passage_chars=1500, stride_chars=1200, max_passages=8
+- Aggregation: AvgTopK (`avg_topk=3`)
+- fp16: enabled
+- Alpha sweep: 0.0–0.5
+- Best: alpha=0.25 → MAP ≈ **0.3523**
+
+Conclusion: **worse than MaxP** for this setting; not worth continuing vs the checkpointed MaxP configuration.
 
 ## Implementation challenges + fixes
 
@@ -200,6 +330,17 @@ Mitigations implemented:
 7) **Dense reranking with isotropy / whitening**
    - Inspired by isotropy post-processing work: compute query+doc embeddings for candidates, apply whitening transform, and rerank by dot product.
    - This is a pure reranker and does not require access to the HNSW stored vectors.
+
+8) **Lecture-inspired: passage selection + local context smoothing (speed-friendly)**
+   - Lecture 11 (Passage Retrieval) highlights that short relevant passages can mismatch query vocab; common mitigations include using the ambient document and neighboring passages.
+   - Actionable variants that fit our current “split-doc-into-passages then MonoT5” pipeline (no re-indexing required):
+     - For tail documents, select the best passage by lexical overlap, but also consider scoring a small window of neighboring passages (e.g., best passage + its adjacent segments) under the same passage budget.
+     - Try PARADE-style aggregation variants that are less brittle than pure MaxP (e.g., softmax-weighted average or hybrid MaxP/AvgTopK), especially on tail docs.
+   - Constraint: keep total passages/query bounded to stay under ~1 hour for 250 queries.
+
+9) **Lecture-inspired: entity/term feedback (optional, higher effort)**
+   - Lecture 11 (Entity-Based Relevance Feedback) suggests combining term-based PRF (RM3-style) with entity signals.
+   - If time permits: experiment with a lightweight proxy for entity expansion on top feedback docs (avoid heavy entity linkers unless it stays reproducible and fast).
 
 ## Literature / recent work highlights
 
@@ -274,3 +415,15 @@ These are public models that explicitly mention Robust04 fine-tuning:
   - Swept higher `monot5p-top-n` for passage-level reranking with `cramraj8/duqgen-monot5-3b-robust04-1k`.
   - New best on judged queries: `top_n=1000`, `agg=max`, `alpha=0.3`, `fp16` → MAP ≈ **0.3743**.
   - Checkpoint notebook: `robust04_checkpoint_0.3743_monot5p_duqgen.ipynb`
+  - Tried AvgTopK aggregation (`avg_topk=3`) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3523** (alpha=0.25), significantly worse than MaxP.
+  - Tried no-overlap passages (`stride_chars=1500`) with MaxP for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3729** (alpha=0.25), slightly below the checkpointed overlap setting.
+  - Increased `max_passages` to 10 (still MaxP, `stride_chars=1200`) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3759** (alpha=0.3), a small improvement over the checkpoint.
+  - Extended coverage (`doc_max_chars=20000`, `max_passages=15`, MaxP) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3767** (alpha=0.3), another small improvement.
+
+- **2026-01-11**
+  - Reviewed course lecture notes and added lecture-inspired experiment ideas (passage selection + neighboring passage smoothing; optional entity/term feedback) to the “Next experiments” section.
+
+- **2026-01-12**
+  - Implemented additional MonoT5-passages aggregation modes: `softmax` and `hybrid`.
+  - Added a caching optimization so MonoT5-passages alpha/aggregation sweeps skip doc text fetch and model scoring when raw passage scores are already cached.
+  - New best on judged queries: `top_n=1000`, `doc_max_chars=20000`, `max_passages=15`, `agg=hybrid` (`hybrid_lambda=0.85`, `avg_topk=3`), `alpha=0.32`, `fp16` → MAP ≈ **0.3774**.

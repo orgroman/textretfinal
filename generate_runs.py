@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 os.environ.setdefault("JAVA_TOOL_OPTIONS", "-Dorg.apache.lucene.store.MMapDirectory.enableMemorySegments=false")
 import re
@@ -6,6 +7,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+
+from cache_utils import DiskCache
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -49,6 +52,37 @@ def fetch_doc_texts(
                 txt = txt[:max_chars]
             cache[docid] = txt
         out.append(cache[docid])
+    return out
+
+
+def fetch_doc_texts_disk_cached(
+    searcher: LuceneSearcher,
+    docids: List[str],
+    mem_cache: Dict[str, str],
+    max_chars: int,
+    disk_cache: DiskCache,
+) -> List[str]:
+    out: List[str] = []
+    for docid in docids:
+        if docid in mem_cache:
+            out.append(mem_cache[docid])
+            continue
+
+        key = {"index": "robust04", "docid": docid, "max_chars": int(max_chars)}
+        txt = disk_cache.get("doc_texts", key)
+        if txt is None:
+            try:
+                doc = searcher.doc(docid)
+                raw = "" if doc is None else (doc.raw() or "")
+            except Exception:
+                raw = ""
+            txt = raw_to_text(raw)
+            if max_chars > 0:
+                txt = txt[:max_chars]
+            disk_cache.set("doc_texts", key, txt)
+
+        mem_cache[docid] = txt
+        out.append(txt)
     return out
 
 
@@ -187,6 +221,111 @@ def compute_monot5_passage_scores(
     return out
 
 
+def compute_monot5_passage_raw_scores(
+    tokenizer: AutoTokenizer,
+    model: AutoModelForSeq2SeqLM,
+    true_id: int,
+    false_id: int,
+    query: str,
+    docids: List[str],
+    doc_texts: List[str],
+    device: str,
+    batch_size: int,
+    max_length: int,
+    passage_chars: int,
+    stride_chars: int,
+    max_passages: int,
+) -> Dict[str, List[float]]:
+    decoder_start = model.config.decoder_start_token_id
+    if decoder_start is None:
+        decoder_start = tokenizer.pad_token_id
+
+    ex_docids: List[str] = []
+    ex_texts: List[str] = []
+    for d, t in zip(docids, doc_texts):
+        passages = _split_passages(
+            t,
+            passage_chars=passage_chars,
+            stride_chars=stride_chars,
+            max_passages=max_passages,
+        )
+        for p in passages:
+            ex_docids.append(d)
+            ex_texts.append(f"Query: {query} Document: {p} Relevant:")
+
+    doc_to_scores: Dict[str, List[float]] = defaultdict(list)
+    with torch.no_grad():
+        for batch_docids, batch_text in zip(chunked(ex_docids, batch_size), chunked(ex_texts, batch_size)):
+            enc = tokenizer(
+                batch_text,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            decoder_input_ids = torch.full(
+                (len(batch_text), 1),
+                int(decoder_start),
+                dtype=torch.long,
+                device=device,
+            )
+            logits = model(**enc, decoder_input_ids=decoder_input_ids).logits
+            step = logits[:, 0, :]
+            batch_scores = (step[:, true_id] - step[:, false_id]).detach().cpu().tolist()
+            for d, s in zip(batch_docids, batch_scores):
+                doc_to_scores[d].append(float(s))
+
+    return {d: doc_to_scores.get(d, []) for d in docids}
+
+
+def aggregate_monot5_passage_scores(
+    raw_scores: Dict[str, List[float]],
+    docids: List[str],
+    agg: str,
+    avg_topk: int,
+    max_passages: int,
+    softmax_temp: float = 1.0,
+    hybrid_lambda: float = 0.5,
+) -> Dict[str, float]:
+    k_passages = max(1, int(max_passages))
+    out: Dict[str, float] = {}
+    for d in docids:
+        scores = (raw_scores.get(d, []) or [])[:k_passages]
+        if not scores:
+            out[d] = 0.0
+            continue
+        if agg == "avg_topk":
+            k_take = max(1, int(avg_topk))
+            topk = sorted(scores, reverse=True)[:k_take]
+            out[d] = float(sum(topk) / len(topk))
+        elif agg == "softmax":
+            t = float(softmax_temp)
+            if not (t > 0.0):
+                t = 1.0
+            m = float(max(scores)) / t
+            exps = [math.exp(float(s) / t - m) for s in scores]
+            denom = float(sum(exps))
+            if denom <= 0.0:
+                out[d] = float(max(scores))
+            else:
+                out[d] = float(sum(e * float(s) for e, s in zip(exps, scores)) / denom)
+        elif agg == "hybrid":
+            lam = float(hybrid_lambda)
+            if lam < 0.0:
+                lam = 0.0
+            if lam > 1.0:
+                lam = 1.0
+            max_s = float(max(scores))
+            k_take = max(1, int(avg_topk))
+            topk = sorted(scores, reverse=True)[:k_take]
+            avg_s = float(sum(topk) / len(topk))
+            out[d] = float(lam * max_s + (1.0 - lam) * avg_s)
+        else:
+            out[d] = float(max(scores))
+    return out
+
+
 def read_queries_tsv(path: Path) -> Dict[str, str]:
     queries: Dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -279,6 +418,9 @@ def main() -> None:
     parser.add_argument("--out2", default="run_2.res")
     parser.add_argument("--out3", default="run_3.res")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--cache-dir", default="/workspace/.cache")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--cache-refresh", action="store_true")
     parser.add_argument("--k", type=int, default=1000)
     parser.add_argument("--rerank3-monot5", action="store_true")
     parser.add_argument("--monot5-model", default="castorini/monot5-base-msmarco")
@@ -298,8 +440,12 @@ def main() -> None:
     parser.add_argument("--monot5p-passage-chars", type=int, default=1500)
     parser.add_argument("--monot5p-stride-chars", type=int, default=1200)
     parser.add_argument("--monot5p-max-passages", type=int, default=8)
-    parser.add_argument("--monot5p-agg", default="max", choices=["max", "avg_topk"])
+    parser.add_argument("--monot5p-score-top-n", type=int, default=None)
+    parser.add_argument("--monot5p-score-max-passages", type=int, default=None)
+    parser.add_argument("--monot5p-agg", default="max", choices=["max", "avg_topk", "softmax", "hybrid"])
     parser.add_argument("--monot5p-avg-topk", type=int, default=3)
+    parser.add_argument("--monot5p-softmax-temp", type=float, default=1.0)
+    parser.add_argument("--monot5p-hybrid-lambda", type=float, default=0.5)
     parser.add_argument("--monot5p-fp16", action="store_true")
     args = parser.parse_args()
 
@@ -311,6 +457,13 @@ def main() -> None:
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    disk_cache = DiskCache(
+        cache_dir=Path(str(args.cache_dir)),
+        enabled=not bool(args.no_cache),
+        refresh=bool(args.cache_refresh),
+    )
+    print("cache_dir", str(disk_cache.cache_dir), "cache_enabled", disk_cache.enabled, "cache_refresh", disk_cache.refresh)
 
     if args.rerank3_monot5 and args.rerank3_monot5_passages:
         raise ValueError("choose only one of --rerank3-monot5 or --rerank3-monot5-passages")
@@ -370,29 +523,52 @@ def main() -> None:
         for i, qid in enumerate(test_qids, start=1):
             query = queries[qid]
 
-            rm3_art = retrieve(rm3, query, k=k)
-            pp_art = retrieve(spladepp, query, k=k)
-            v3_art = retrieve(spladev3, query, k=k)
-            dense_art = retrieve(dense, query, k=k)
+            baseline_key = {
+                "qid": qid,
+                "query": query,
+                "k": int(k),
+                "rm3": {"index": "robust04", "bm25": [0.9, 0.4], "rm3": [20, 5, 0.5]},
+                "spladepp_index": "beir-v1.0.0-robust04.splade-pp-ed",
+                "spladev3_index": "beir-v1.0.0-robust04.splade-v3",
+                "dense_index": "beir-v1.0.0-robust04.bge-base-en-v1.5.hnsw",
+                "dense_ef_search": 1000,
+                "w_run2": w_run2,
+                "w_run3": w_run3,
+            }
 
-            run_1[qid] = rm3_art.ranked[:k]
+            cached_baseline = disk_cache.get("generate_runs_baseline", baseline_key)
+            if cached_baseline is None:
+                rm3_art = retrieve(rm3, query, k=k)
+                pp_art = retrieve(spladepp, query, k=k)
+                v3_art = retrieve(spladev3, query, k=k)
+                dense_art = retrieve(dense, query, k=k)
 
-            fallback_zero = [(d, 0.0) for d, _ in rm3_art.ranked]
+                run1_ranked = rm3_art.ranked[:k]
+                fallback_zero = [(d, 0.0) for d, _ in rm3_art.ranked]
 
-            fused2 = fuse_weighted_minmax(
-                [rm3_art.docids_scores, pp_art.docids_scores, dense_art.docids_scores],
-                w_run2,
-                depth=k,
-            )
-            fused2 = ensure_k(fused2, fallback_zero, k=k)
+                fused2 = fuse_weighted_minmax(
+                    [rm3_art.docids_scores, pp_art.docids_scores, dense_art.docids_scores],
+                    w_run2,
+                    depth=k,
+                )
+                fused2 = ensure_k(fused2, fallback_zero, k=k)
+
+                fused3 = fuse_weighted_minmax(
+                    [rm3_art.docids_scores, pp_art.docids_scores, v3_art.docids_scores, dense_art.docids_scores],
+                    w_run3,
+                    depth=k,
+                )
+                fused3 = ensure_k(fused3, fallback_zero, k=k)
+
+                disk_cache.set("generate_runs_baseline", baseline_key, (run1_ranked, fused2, fused3))
+            else:
+                run1_ranked, fused2, fused3 = cached_baseline
+                fallback_zero = [(d, 0.0) for d, _ in run1_ranked]
+                fused2 = ensure_k(fused2, fallback_zero, k=k)
+                fused3 = ensure_k(fused3, fallback_zero, k=k)
+
+            run_1[qid] = run1_ranked
             run_2[qid] = fused2
-
-            fused3 = fuse_weighted_minmax(
-                [rm3_art.docids_scores, pp_art.docids_scores, v3_art.docids_scores, dense_art.docids_scores],
-                w_run3,
-                depth=k,
-            )
-            fused3 = ensure_k(fused3, fallback_zero, k=k)
 
             if args.rerank3_monot5:
                 assert monot5_tokenizer is not None
@@ -404,11 +580,12 @@ def main() -> None:
                 base_norm = minmax_norm(base_scores)
 
                 top_docids = [d for d, _ in fused3[: args.monot5_top_n]]
-                top_texts = fetch_doc_texts(
+                top_texts = fetch_doc_texts_disk_cached(
                     rm3,
                     top_docids,
-                    cache=doc_text_cache,
+                    mem_cache=doc_text_cache,
                     max_chars=args.monot5_max_chars,
+                    disk_cache=disk_cache,
                 )
                 extra_top = compute_monot5_scores(
                     monot5_tokenizer,
@@ -436,30 +613,68 @@ def main() -> None:
                 assert true_id is not None
                 assert false_id is not None
 
+                score_top_n = args.monot5p_score_top_n if args.monot5p_score_top_n is not None else args.monot5p_top_n
+                score_top_n = max(int(score_top_n), int(args.monot5p_top_n))
+
+                score_max_passages = (
+                    args.monot5p_score_max_passages
+                    if args.monot5p_score_max_passages is not None
+                    else args.monot5p_max_passages
+                )
+                score_max_passages = max(int(score_max_passages), int(args.monot5p_max_passages))
+
+                score_pairs = fused3[:score_top_n]
+                score_docids = [d for d, _ in score_pairs]
+                raw_key = {
+                    "qid": qid,
+                    "query": query,
+                    "docids": score_docids,
+                    "model_name": str(args.monot5p_model),
+                    "device": str(device),
+                    "batch_size": int(args.monot5p_batch_size),
+                    "max_length": int(args.monot5p_max_length),
+                    "use_fp16": bool(args.monot5p_fp16),
+                    "doc_max_chars": int(args.monot5p_doc_max_chars),
+                    "passage_chars": int(args.monot5p_passage_chars),
+                    "stride_chars": int(args.monot5p_stride_chars),
+                    "max_passages": int(score_max_passages),
+                }
+                raw_scores = disk_cache.get("monot5p_raw", raw_key)
+                if raw_scores is None:
+                    score_texts = fetch_doc_texts_disk_cached(
+                        rm3,
+                        score_docids,
+                        mem_cache=doc_text_cache,
+                        max_chars=args.monot5p_doc_max_chars,
+                        disk_cache=disk_cache,
+                    )
+                    raw_scores = compute_monot5_passage_raw_scores(
+                        monot5_tokenizer,
+                        monot5_model,
+                        true_id,
+                        false_id,
+                        query=query,
+                        docids=score_docids,
+                        doc_texts=score_texts,
+                        device=device,
+                        batch_size=args.monot5p_batch_size,
+                        max_length=args.monot5p_max_length,
+                        passage_chars=args.monot5p_passage_chars,
+                        stride_chars=args.monot5p_stride_chars,
+                        max_passages=score_max_passages,
+                    )
+                    disk_cache.set("monot5p_raw", raw_key, raw_scores)
+
                 top_pairs = fused3[: args.monot5p_top_n]
                 top_docids = [d for d, _ in top_pairs]
-                top_texts = fetch_doc_texts(
-                    rm3,
+                extra_top = aggregate_monot5_passage_scores(
+                    raw_scores,
                     top_docids,
-                    cache=doc_text_cache,
-                    max_chars=args.monot5p_doc_max_chars,
-                )
-                extra_top = compute_monot5_passage_scores(
-                    monot5_tokenizer,
-                    monot5_model,
-                    true_id,
-                    false_id,
-                    query=query,
-                    docids=top_docids,
-                    doc_texts=top_texts,
-                    device=device,
-                    batch_size=args.monot5p_batch_size,
-                    max_length=args.monot5p_max_length,
-                    passage_chars=args.monot5p_passage_chars,
-                    stride_chars=args.monot5p_stride_chars,
-                    max_passages=args.monot5p_max_passages,
                     agg=str(args.monot5p_agg),
                     avg_topk=args.monot5p_avg_topk,
+                    max_passages=args.monot5p_max_passages,
+                    softmax_temp=float(args.monot5p_softmax_temp),
+                    hybrid_lambda=float(args.monot5p_hybrid_lambda),
                 )
 
                 base_scores = {d: s for d, s in top_pairs}
