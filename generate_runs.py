@@ -3,7 +3,7 @@ import math
 import os
 os.environ.setdefault("JAVA_TOOL_OPTIONS", "-Dorg.apache.lucene.store.MMapDirectory.enableMemorySegments=false")
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -15,15 +15,105 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from pyserini.encode import SpladeQueryEncoder
 from pyserini.search.lucene import LuceneHnswDenseSearcher, LuceneImpactSearcher, LuceneSearcher
+from pyserini.search.lucene import querybuilder
+from pyserini.analysis import Analyzer, get_lucene_analyzer
+from pyserini.pyclass import autoclass
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_ENTITY_PHRASE_RE = re.compile(r"\b(?:[A-Z][a-z]+(?:[-'][A-Za-z]+)?)(?:\s+(?:[A-Z][a-z]+(?:[-'][A-Za-z]+)?)){0,2}\b")
+_ENTITY_STOP_FIRST = {
+    "A",
+    "An",
+    "And",
+    "At",
+    "By",
+    "For",
+    "From",
+    "In",
+    "Is",
+    "It",
+    "Its",
+    "Mr",
+    "Mrs",
+    "Ms",
+    "Dr",
+    "Of",
+    "On",
+    "Or",
+    "The",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "To",
+    "With",
+    "Without",
+}
+
+JTerm = autoclass("org.apache.lucene.index.Term")
+JPhraseQueryBuilder = autoclass("org.apache.lucene.search.PhraseQuery$Builder")
 
 
 def raw_to_text(raw: str) -> str:
     s = _TAG_RE.sub(" ", raw)
     s = _WS_RE.sub(" ", s)
     return s.strip()
+
+
+def extract_entity_phrases(text: str) -> List[str]:
+    s = text or ""
+    out: List[str] = []
+    for m in _ENTITY_PHRASE_RE.finditer(s):
+        phrase = (m.group(0) or "").strip()
+        if not phrase:
+            continue
+        first = phrase.split(" ", 1)[0]
+        if first in _ENTITY_STOP_FIRST:
+            continue
+        if len(phrase) < 3:
+            continue
+        out.append(phrase)
+    return out
+
+
+def build_entity_lite_query(
+    query: str,
+    entity_phrases: List[Tuple[str, int]],
+    analyzer: Analyzer,
+    orig_boost: float,
+    phrase_boost: float,
+    token_boost: float,
+    phrase_slop: int,
+):
+    bq = querybuilder.get_boolean_query_builder()
+    bq.setMinimumNumberShouldMatch(1)
+
+    q_tokens = analyzer.analyze(query)
+    for tok in q_tokens:
+        tq = querybuilder.JTermQuery(JTerm("contents", tok))
+        bq.add(querybuilder.get_boost_query(tq, float(orig_boost)), querybuilder.JBooleanClauseOccur.should.value)
+
+    for phrase, df in entity_phrases:
+        p_tokens = analyzer.analyze(phrase)
+        if not p_tokens:
+            continue
+
+        pb = JPhraseQueryBuilder()
+        pb.setSlop(int(phrase_slop))
+        for tok in p_tokens:
+            pb.add(JTerm("contents", tok))
+        pq = pb.build()
+        boost = float(phrase_boost) * (1.0 + math.log1p(float(df)))
+        bq.add(querybuilder.get_boost_query(pq, boost), querybuilder.JBooleanClauseOccur.should.value)
+
+        if float(token_boost) > 0.0:
+            t_boost = float(token_boost) * (1.0 + math.log1p(float(df)))
+            for tok in p_tokens:
+                tq = querybuilder.JTermQuery(JTerm("contents", tok))
+                bq.add(querybuilder.get_boost_query(tq, t_boost), querybuilder.JBooleanClauseOccur.should.value)
+
+    return bq.build()
 
 
 def chunked(items: List[str], batch_size: int) -> Iterable[List[str]]:
@@ -422,6 +512,15 @@ def main() -> None:
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--cache-refresh", action="store_true")
     parser.add_argument("--k", type=int, default=1000)
+    parser.add_argument("--run2-method", default="fusion", choices=["fusion", "entity_lite"])
+    parser.add_argument("--run2-entity-fb-docs", type=int, default=10)
+    parser.add_argument("--run2-entity-doc-max-chars", type=int, default=8000)
+    parser.add_argument("--run2-entity-max-phrases", type=int, default=30)
+    parser.add_argument("--run2-entity-min-doc-freq", type=int, default=2)
+    parser.add_argument("--run2-entity-orig-boost", type=float, default=1.0)
+    parser.add_argument("--run2-entity-phrase-boost", type=float, default=2.0)
+    parser.add_argument("--run2-entity-token-boost", type=float, default=0.25)
+    parser.add_argument("--run2-entity-phrase-slop", type=int, default=2)
     parser.add_argument("--rerank3-monot5", action="store_true")
     parser.add_argument("--monot5-model", default="castorini/monot5-base-msmarco")
     parser.add_argument("--monot5-top-n", type=int, default=200)
@@ -474,6 +573,9 @@ def main() -> None:
     rm3.set_bm25(0.9, 0.4)
     rm3.set_rm3(20, 5, 0.5)
 
+    bm25 = LuceneSearcher.from_prebuilt_index("robust04")
+    bm25.set_bm25(0.9, 0.4)
+
     spladepp_encoder = SpladeQueryEncoder("naver/splade-cocondenser-ensembledistil", device=device)
     spladepp = LuceneImpactSearcher.from_prebuilt_index("beir-v1.0.0-robust04.splade-pp-ed", spladepp_encoder)
 
@@ -491,6 +593,7 @@ def main() -> None:
     true_id = None
     false_id = None
     doc_text_cache: Dict[str, str] = {}
+    lucene_analyzer = Analyzer(get_lucene_analyzer())
 
     if args.rerank3_monot5 or args.rerank3_monot5_passages:
         model_name = args.monot5_model if args.rerank3_monot5 else args.monot5p_model
@@ -568,7 +671,58 @@ def main() -> None:
                 fused3 = ensure_k(fused3, fallback_zero, k=k)
 
             run_1[qid] = run1_ranked
-            run_2[qid] = fused2
+
+            if str(args.run2_method) == "entity_lite":
+                fb_docs = max(1, int(args.run2_entity_fb_docs))
+                fb_docids = [d for d, _ in run1_ranked[:fb_docs]]
+                phrases_key = {
+                    "qid": qid,
+                    "query": query,
+                    "fb_docids": fb_docids,
+                    "fb_docs": int(fb_docs),
+                    "doc_max_chars": int(args.run2_entity_doc_max_chars),
+                    "max_phrases": int(args.run2_entity_max_phrases),
+                    "min_doc_freq": int(args.run2_entity_min_doc_freq),
+                }
+                entity_phrases = disk_cache.get("run2_entity_phrases", phrases_key)
+                if entity_phrases is None:
+                    fb_texts = fetch_doc_texts_disk_cached(
+                        rm3,
+                        fb_docids,
+                        mem_cache=doc_text_cache,
+                        max_chars=args.run2_entity_doc_max_chars,
+                        disk_cache=disk_cache,
+                    )
+                    df_counter: Counter = Counter()
+                    for t in fb_texts:
+                        df_counter.update(set(extract_entity_phrases(t)))
+                    min_df = max(1, int(args.run2_entity_min_doc_freq))
+                    cand = [(p, int(c)) for p, c in df_counter.items() if int(c) >= min_df]
+                    cand.sort(key=lambda x: (-x[1], x[0]))
+                    entity_phrases = cand[: max(0, int(args.run2_entity_max_phrases))]
+                    disk_cache.set("run2_entity_phrases", phrases_key, entity_phrases)
+
+                qobj = build_entity_lite_query(
+                    query=query,
+                    entity_phrases=entity_phrases,
+                    analyzer=lucene_analyzer,
+                    orig_boost=float(args.run2_entity_orig_boost),
+                    phrase_boost=float(args.run2_entity_phrase_boost),
+                    token_boost=float(args.run2_entity_token_boost),
+                    phrase_slop=int(args.run2_entity_phrase_slop),
+                )
+                hits2 = bm25.search(qobj, k=k)
+                ranked2 = [(h.docid, float(h.score)) for h in hits2]
+
+                seen2 = {d for d, _ in ranked2}
+                tail_docids = [d for d, _ in run1_ranked if d not in seen2]
+                tail_start = (ranked2[-1][1] if ranked2 else 0.0) - 1.0
+                tail_step = 1e-3
+                tail_scores = {d: tail_start - tail_step * i for i, d in enumerate(tail_docids, start=1)}
+                ranked2 = ranked2 + [(d, tail_scores[d]) for d in tail_docids]
+                run_2[qid] = ranked2[:k]
+            else:
+                run_2[qid] = fused2
 
             if args.rerank3_monot5:
                 assert monot5_tokenizer is not None
@@ -701,6 +855,7 @@ def main() -> None:
                 print(f"processed {i}/{len(test_qids)} test queries")
     finally:
         rm3.close()
+        bm25.close()
         spladepp.close()
         spladev3.close()
         dense.close()
