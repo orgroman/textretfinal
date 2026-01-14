@@ -750,7 +750,9 @@ def main() -> None:
     queries_path = Path(args.queries)
     queries = read_queries_tsv(queries_path)
     all_qids = list(queries.keys())
-    _, test_qids = split_train_test_qids(all_qids)
+    # Run on ALL queries for the overnight experiment
+    test_qids = all_qids
+    print(f"Targeting ALL {len(test_qids)} queries.")
 
     device = args.device
     if device is None:

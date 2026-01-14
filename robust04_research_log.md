@@ -64,6 +64,46 @@ We use **min-max normalization per run** and a **weighted sum**.
   - Weights: (0.55, 0.10, 0.15, 0.20)
   - MAP ≈ **0.2997**
 
+### Training-free entity-aware reranking (Run 2)
+
+Goal: keep Run 2 distinct from plain fusion without training.
+
+Approach (implemented in `generate_runs.py`, `--run2-method entity_rerank`):
+
+- Candidate set: fused `run_3` (min-max) depth=1000
+- Compute an entity-match score for top-N docs and blend it with the baseline score
+- We only re-order within top-N and append the remainder unchanged (stability / drift reduction)
+
+Key implementation fixes:
+
+- Entity match regex fix: word boundary must be `\b` (was mistakenly using a literal `\\b`, causing all matches to fail)
+- Robust04 title queries are mostly lowercase, so we added fallback “query entities” (content tokens + bigrams) when no capitalized phrases exist
+
+Entity scoring iterations (judged qids 301–350):
+
+- Baseline fused3 MAP ≈ **0.299655**
+- Candidate-set IDF weighting for query entities + phrase length weighting + TF cap + DF-ratio cutoff
+  - Best: `top_n=400`, `alpha=0.99` → MAP ≈ **0.299762**
+
+Collection-IDF variant:
+
+- Added optional collection-level IDF from Lucene via `LuceneIndexReader.get_term_counts()`
+  - Flag: `--run2-entity-rerank-use-collection-idf`
+  - Best: `top_n=400`, `alpha=0.99` → MAP ≈ **0.299782** (tiny but consistent gain vs candidate-set IDF)
+
+Hard-query gating attempt (lecture-inspired “entities help hard queries”):
+
+- Gate mode: if baseline is “confident” (large top-1 vs top-k score margin), skip entity influence
+  - Flag: `--run2-entity-rerank-gate margin` with `--run2-entity-rerank-gate-k` and `--run2-entity-rerank-gate-margin`
+  - Best sweep found: `alpha=0.97`, `gate_k=20`, `gate_margin=0.30` → MAP ≈ **0.299684**
+  - Conclusion: did not beat the best non-gated setup.
+
+Entity PRF attempt (entity phrases from RM3 feedback docs):
+
+- Extract entity phrases from top-RM3 docs, score candidates by those phrases + DF filtering
+  - Best grid point: MAP ≈ **0.29933**
+  - Conclusion: not beneficial in this lightweight form.
+
 ### Neural reranking (improves over fusion)
 
 - **MonoT5 passage-level reranking of fused run_3** (top-200, MaxP aggregation)
@@ -169,6 +209,41 @@ We use **min-max normalization per run** and a **weighted sum**.
   - Alpha sweep: 0.1–0.35
   - Best: alpha=0.2 → MAP ≈ **0.3604**
   - Runtime: ≈ **14.70 sec/query** (estimated 250 queries ≈ **61.2 min**; slightly above the 1-hour target in this timing)
+
+## Lecture-Inspired Training-Free Experiments (Lectures 7–12)
+
+We investigated additional methods from the provided course materials to diversify Run 2/3.
+
+### Query Likelihood (QL) with Dirichlet Smoothing (Lecture 9)
+
+- **Hypothesis**: QL (LMD) captures different probabilistic signals than BM25 and might help in fusion.
+- **Experiment**:
+  - Swept `mu` parameter (500–3000) on judged queries.
+  - Best `mu=500` → MAP **0.2424** (vs BM25 baseline **0.2455**).
+  - Combined with RM3: QL+RM3 MAP **0.2649** (vs BM25+RM3 **0.2719**).
+  - Fusion of (BM25+RM3) + (QL+RM3): MAP **0.2719** (pure BM25+RM3 weight).
+- **Conclusion**: QL is redundant with and weaker than BM25+RM3 on Robust04; no fusion gain found.
+
+### Sequential Dependence Model (SDM) Reranking (Lecture 8/11)
+
+- **Hypothesis**: Rerank top results by boosting documents with exact bigrams (ordered window) or proximal bigrams (unordered window).
+- **Experiment**:
+  - Implemented "Blind SDM" reranker (counting matches in analyzed tokens) on top of BM25+RM3 candidates (top-200).
+  - Parameters: `w_ordered` (exact), `w_unordered` (window=8), `alpha` (interpolation).
+  - Baseline MAP (top-200): **0.2486**
+  - Best SDM MAP: **0.2493** (`w_o=0.01`, `w_u=0.1`, `alpha=0.3`).
+- **Conclusion**: Very marginal gain (+0.0007). Computationally expensive in Python (token scanning) for minimal lift. Not viable for production Run 2.
+
+### Neural Pseudo-Relevance Feedback (Neural PRF)
+
+- **Hypothesis**: Use a strong MonoT5 reranker to identify truly relevant documents in the top-N, then extract expansion terms from them to re-query the collection (Lecture 11 idea: better feedback docs = better query expansion).
+- **Experiment**:
+  - Baseline: BM25+RM3 (top-50) MAP ≈ **0.2025** (low due to shallow depth in test script).
+  - MonoT5-3B Reranked (top-50) MAP ≈ **0.1827** (reranking top-50 only).
+  - Feedback: Top-10 docs from MonoT5 reranked list used for term expansion (weighted by softmaxed MonoT5 scores).
+  - Re-retrieval: BM25 search with expanded query.
+  - Result: MAP ≈ **0.1658**.
+- **Conclusion**: Failed. The Neural PRF loop degraded performance significantly, likely due to query drift or poor manual term weighting implementation compared to Pyserini's optimized RM3.
 
 ## Methods tried that did *not* improve MAP (in our sweeps)
 
@@ -297,6 +372,78 @@ Mitigations implemented:
 - Generated run files (current workspace):
   - `run_1.res`, `run_2.res`, `run_3.res` (current “official” output from notebook)
   - `run_3_monot5.res` (extra run file from earlier command)
+  - `run_2_final_entityrerank_fixed.res` (entity_rerank with `top_n=400`, `alpha=0.99`, collection-IDF enabled)
+
+## Lecture-Inspired Training-Free Experiments (Lectures 7–12)
+
+We investigated additional methods from the provided course materials to diversify Run 2/3.
+
+### Query Likelihood (QL) with Dirichlet Smoothing (Lecture 9)
+
+- **Hypothesis**: QL (LMD) captures different probabilistic signals than BM25 and might help in fusion.
+- **Experiment**:
+  - Swept `mu` parameter (500–3000) on judged queries.
+  - Best `mu=500` → MAP **0.2424** (vs BM25 baseline **0.2455**).
+  - Combined with RM3: QL+RM3 MAP **0.2649** (vs BM25+RM3 **0.2719**).
+  - Fusion of (BM25+RM3) + (QL+RM3): MAP **0.2719** (pure BM25+RM3 weight).
+- **Conclusion**: QL is redundant with and weaker than BM25+RM3 on Robust04; no fusion gain found.
+
+### Sequential Dependence Model (SDM) Reranking (Lecture 8/11)
+
+- **Hypothesis**: Rerank top results by boosting documents with exact bigrams (ordered window) or proximal bigrams (unordered window).
+- **Experiment**:
+  - Implemented "Blind SDM" reranker (counting matches in analyzed tokens) on top of BM25+RM3 candidates (top-200).
+  - Parameters: `w_ordered` (exact), `w_unordered` (window=8), `alpha` (interpolation).
+  - Baseline MAP (top-200): **0.2486**
+  - Best SDM MAP: **0.2493** (`w_o=0.01`, `w_u=0.1`, `alpha=0.3`).
+- **Conclusion**: Very marginal gain (+0.0007). Computationally expensive in Python (token scanning) for minimal lift. Not viable for production Run 2.
+
+### Neural Pseudo-Relevance Feedback (Neural PRF)
+
+- **Hypothesis**: Use a strong MonoT5 reranker to identify truly relevant documents in the top-N, then extract expansion terms from them to re-query the collection (Lecture 11 idea: better feedback docs = better query expansion).
+- **Experiment**:
+  - Baseline: BM25+RM3 (top-50) MAP ≈ **0.2025** (low due to shallow depth in test script).
+  - MonoT5-3B Reranked (top-50) MAP ≈ **0.1827** (reranking top-50 only).
+  - Feedback: Top-10 docs from MonoT5 reranked list used for term expansion (weighted by softmaxed MonoT5 scores).
+  - Re-retrieval: BM25 search with expanded query.
+  - Result: MAP ≈ **0.1658**.
+- **Conclusion**: Failed. The Neural PRF loop degraded performance significantly, likely due to query drift or poor manual term weighting implementation compared to Pyserini's optimized RM3.
+
+### Rocchio with Negative Feedback (Cross-Validation)
+
+- **Hypothesis**: Explicitly utilizing negative feedback terms (from bottom-k docs) via Rocchio algorithm might outperform standard RM3 (which only uses positive feedback).
+- **Experiment**:
+  - Implemented 5-Fold Cross-Validation on the 50 judged queries.
+  - Tuned `alpha` (query), `beta` (positive), `gamma` (negative), `top_fb_terms/docs`, `bottom_fb_terms/docs`.
+  - Grid: `gamma` in [0.0, 0.1, 0.2], `beta` in [0.4, 0.6, 0.75].
+  - **Results**:
+    - Average CV MAP: **0.2619**
+    - Oracle MAP (best params on all 50): **0.2720**
+    - Baseline RM3 MAP: **0.2719**
+- **Conclusion**: Rocchio with negative feedback matches but does not reliably outperform the strong RM3 baseline on Robust04. The added complexity of negative feedback (gamma) introduced variance without significant lift.
+
+### Neural Rocchio (Neural PRF with Hard Negatives)
+
+- **Hypothesis**: Enhance standard Neural PRF by explicitly subtracting "hard negative" terms. We use MonoT5 to rerank the top-50 candidates.
+  - **Positives**: Top-10 docs after MonoT5 reranking.
+  - **Negatives**: Bottom-10 docs from the original top-50 list (docs BM25 liked but MonoT5 pushed down).
+  - **Algorithm**: Rocchio expansion (`alpha=1.0`, `beta=0.75`, `gamma=0.15`).
+- **Experiment**:
+  - Baseline (script-local BM25+RM3): MAP **0.2025**
+  - MonoT5 Reranked (top-50 only): MAP **0.1827** (reranking only a shallow pool lowers MAP vs full depth).
+  - Neural Rocchio Re-retrieval: MAP **0.1891**
+- **Conclusion**: Failed. While it improved over the positive-only Neural PRF (0.1658 → 0.1891), it still hurt performance compared to the baseline. The query expansion vectors derived from neural-selected documents (via TF-IDF) appear less robust than Pyserini's optimized RM3 implementation.
+
+### Reciprocal Rank Fusion (RRF) vs Weighted Fusion
+
+- **Hypothesis**: RRF is a standard rank-based fusion method that requires no training. It might outperform our hand-tuned min-max weighted fusion.
+- **Experiment**:
+  - Components: RM3, SPLADE++, SPLADE-v3, BGE.
+  - Baselines (MAP@1000): RM3=0.2719, SPLADE++=0.1914, SPLADE-v3=0.1913, BGE=0.1636.
+  - Tested RRF `k` values: 10, 60, 100, 200.
+  - Best RRF Result: `k=10` → MAP **0.2621**.
+  - Reference (Weighted Fusion): MAP **~0.2997**.
+- **Conclusion**: RRF underperforms significantly compared to score-based weighted fusion on Robust04. This is likely because RRF ignores the *strength* of the retrieval scores, and the neural runs (SPLADE/BGE) have lower standalone MAP but provide high-precision signals when properly weighted. Weighted fusion preserves this signal better.
 
 ## Next experiments (highest-upside, realistic)
 
@@ -367,7 +514,30 @@ The following papers are directly relevant to Robust04 and suggest concrete foll
 - Key idea: Splade-like learned sparse retrieval needs **proximity/SDM-style modeling** for long docs; they propose ExactSDM/SoftSDM.
 - Actionable takeaway: improving learned sparse retrieval for Robust04 may require **local proximity signals**. In our constraints, the closest approximation is passage-level max scoring or additional proximity-aware reranking.
 
-### Critically Examining the \"Neural Hype\" (Robust04 meta-analysis)
+### Coordinate Search Thresholding for Binary Representations (binarizarion_methods.md)
+
+- Paper idea summary (NLP embeddings):
+  - Many binarization methods use a **single global threshold** for all dimensions.
+  - Their proposed method uses **Coordinate Search (CS)** to optimize **one threshold per feature dimension**.
+  - CS is derivative-free and works by repeatedly shrinking a per-dimension interval `[L_i, U_i]` using center-based candidates (quarter-points) and selecting the better one by an objective metric (they use F1 for classification).
+
+- Retrieval adaptation idea (Robust04):
+  - Treat each retrieval signal as a “feature dimension”:
+    - RM3 score
+    - SPLADE++ score
+    - Dense score (BGE)
+  - For each query, min-max normalize each signal to `[0,1]`, then **binarize** it via a tunable threshold `t_j`:
+    - `b_j(d) = 1 if norm_j(d) >= t_j else 0`
+  - Final fused score is a weighted sum of these binary indicators (with a tiny continuous tie-break term):
+    - `score(d) = sum_j w_j * b_j(d) + eps * sum_j w_j * norm_j(d)`
+  - Tune the thresholds `t_j` on the 50 judged queries using a small CS loop with objective = **MAP@1000**.
+  - This yields a reproducible, “beyond-hand-tuned” **CS-threshold fusion** run_2 variant (distinct from plain weighted min-max fusion and from RRF).
+
+- Status:
+  - Next step: implement CS-threshold fusion tuning in `experiments_cluster_lsh.py` and record MAP on judged queries.
+  - MAP (judged queries): TBD
+
+### Critically Examining the "Neural Hype" (Robust04 meta-analysis)
 
 - Paper: Yang et al., SIGIR 2019
 - arXiv: https://arxiv.org/abs/1904.09171
@@ -394,36 +564,28 @@ These are public models that explicitly mention Robust04 fine-tuning:
 
 ## References
 
-- Pyserini documentation (usage-search, usage-fetch, fusion examples)
-- BEIR benchmark: “BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models”
-- SPLADE: Formal et al., 2021
-- MonoT5 reranking / T5 for ranking: Nogueira et al., 2020; Nogueira and Lin, 2019
-- RM3 / relevance models: Lavrenko and Croft, 2001
-- BM25: Robertson and Zaragoza, 2009
+## Split Pipeline Optimization (Listwise & HyDE)
 
-## Update log
+### Problem: JVM/Torch Conflicts & OOM
 
-- **2026-01-09**
-  - Added MonoT5 reranking, saw small MAP improvement on judged queries.
-  - Integrated MonoT5 into `generate_runs.py` and updated `robust04_final_project.ipynb`.
+We encountered two major stability issues when implementing advanced LLM-based reranking/generation:
 
-- **2026-01-09**
-  - Started literature survey: PARADE, isotropy post-processing for dense retrieval, SDM-style proximity for learned sparse retrieval.
-  - Found Robust04-tuned MonoT5 3B and ColBERT models on Hugging Face.
+1.  **SIGSEGV Crashes**: Pyserini (Java/Lucene) and PyTorch (Python/CUDA) in the same process caused repeated segmentation faults, likely due to `MMapDirectory` conflicts or memory management fights between the JVM and Python.
+    *   **Fix**: Implemented a **Split Pipeline** architecture.
+        *   **Step 1 (Java)**: Use Pyserini to fetch text/candidates and save to a JSONL file. (e.g., `prepare_listwise_data.py`)
+        *   **Step 2 (Python)**: Use PyTorch to read JSONL, process with LLM, and save output. (e.g., `run_listwise_inference.py`)
+        *   This isolates the JVM from CUDA.
 
-- **2026-01-10**
-  - Swept higher `monot5p-top-n` for passage-level reranking with `cramraj8/duqgen-monot5-3b-robust04-1k`.
-  - New best on judged queries: `top_n=1000`, `agg=max`, `alpha=0.3`, `fp16` → MAP ≈ **0.3743**.
-  - Checkpoint notebook: `robust04_checkpoint_0.3743_monot5p_duqgen.ipynb`
-  - Tried AvgTopK aggregation (`avg_topk=3`) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3523** (alpha=0.25), significantly worse than MaxP.
-  - Tried no-overlap passages (`stride_chars=1500`) with MaxP for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3729** (alpha=0.25), slightly below the checkpointed overlap setting.
-  - Increased `max_passages` to 10 (still MaxP, `stride_chars=1200`) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3759** (alpha=0.3), a small improvement over the checkpoint.
-  - Extended coverage (`doc_max_chars=20000`, `max_passages=15`, MaxP) for duqgen MonoT5-passages (`top_n=1000`); best MAP ≈ **0.3767** (alpha=0.3), another small improvement.
+2.  **OOM on RTX 5090 (32GB VRAM)**:
+    *   Unintentionally launching two 7B models (Listwise Zephyr + HyDE Zephyr) in parallel caused OOM.
+    *   **Attempted Fix**: `vllm` for optimized memory/speed.
+        *   **Result**: Failed. `vllm` hung on CUDA graph capture or crashed with "Engine core initialization failed" in this environment. Using `enforce_eager=True` did not fully resolve stability.
+    *   **Final Strategy**: **Serialized Execution via `transformers` (FP16)**.
+        *   We run one heavy model at a time.
+        *   Listwise Reranking (Judged 50) -> HyDE Generation (Judged 50).
+        *   This ensures 100% stability within the 32GB VRAM budget.
 
-- **2026-01-11**
-  - Reviewed course lecture notes and added lecture-inspired experiment ideas (passage selection + neighboring passage smoothing; optional entity/term feedback) to the “Next experiments” section.
+### Current Status (Judged Queries)
 
-- **2026-01-12**
-  - Implemented additional MonoT5-passages aggregation modes: `softmax` and `hybrid`.
-  - Added a caching optimization so MonoT5-passages alpha/aggregation sweeps skip doc text fetch and model scoring when raw passage scores are already cached.
-  - New best on judged queries: `top_n=1000`, `doc_max_chars=20000`, `max_passages=15`, `agg=hybrid` (`hybrid_lambda=0.85`, `avg_topk=3`), `alpha=0.32`, `fp16` → MAP ≈ **0.3774**.
+*   **Listwise Reranking**: Running on judged set (301-350). Model: `castorini/rank_zephyr_7b_v1_full`.
+*   **HyDE**: Queued. Model: `HuggingFaceH4/zephyr-7b-beta`.

@@ -750,7 +750,8 @@ def main() -> None:
     queries_path = Path(args.queries)
     queries = read_queries_tsv(queries_path)
     all_qids = list(queries.keys())
-    _, test_qids = split_train_test_qids(all_qids)
+    test_qids, _ = split_train_test_qids(all_qids) # Swapped to target JUDGED (train) set
+    print(f"Targeting {len(test_qids)} JUDGED queries.")
 
     device = args.device
     if device is None:
