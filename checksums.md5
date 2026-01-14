@@ -1,0 +1,7 @@
+f3bc1aa9c6f1158dd4b3c088f7dd1708  run_listwise_judged.res
+e9c33c9e077d65f37197df85d5e17fea  run_hyde_fusion_judged.res
+3b0ba62e3d593371e2507ba3e262e9a4  run_baseline_judged.res
+ec038f0e88b4918b5dc3c0744b1e0dc2  run_best_monot5_judged.res
+0fb63a9dfb6432f6afaf4f7b7ad83c69  run_listwise_on_golden_judged.res
+966b93a269f042a18cc511e261553408  run_monot5_on_hyde_judged.res
+a709555338a94dfd66752fec2e8de9b3  run_hytitle_fusion_judged.res

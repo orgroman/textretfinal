@@ -209,5 +209,6 @@ run_*_smoke*.res
 run_*_new.res
 run_*_m5p.res
 run_*_monot5*.res
-pyserini_docs_concatenated.md
 concat_md.py
+*.npy
+*.faiss

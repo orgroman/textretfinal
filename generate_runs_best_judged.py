@@ -86,6 +86,19 @@ JTerm = autoclass("org.apache.lucene.index.Term")
 JPhraseQueryBuilder = autoclass("org.apache.lucene.search.PhraseQuery$Builder")
 
 
+def read_run_file(path: str) -> Dict[str, List[Tuple[str, float]]]:
+    run: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    with open(path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 6: continue
+            qid, _, docid, rank, score, _ = parts
+            run[qid].append((docid, float(score)))
+    # Sort just in case
+    for qid in run:
+        run[qid].sort(key=lambda x: (-x[1], x[0]))
+    return run
+
 def raw_to_text(raw: str) -> str:
     s = _TAG_RE.sub(" ", raw)
     s = _WS_RE.sub(" ", s)
@@ -745,6 +758,8 @@ def main() -> None:
     parser.add_argument("--monot5p-softmax-temp", type=float, default=1.0)
     parser.add_argument("--monot5p-hybrid-lambda", type=float, default=0.5)
     parser.add_argument("--monot5p-fp16", action="store_true")
+    # New argument to skip retrieval and rerank an existing file
+    parser.add_argument("--initial-run", type=str, default=None, help="Path to an existing run file to rerank (skips retrieval).")
     args = parser.parse_args()
 
     queries_path = Path(args.queries)
@@ -829,6 +844,11 @@ def main() -> None:
     w_run2 = [0.60, 0.25, 0.15]
     w_run3 = [0.55, 0.10, 0.15, 0.20]
 
+    initial_run_dict = None
+    if args.initial_run:
+        print(f"Loading initial run from {args.initial_run}...")
+        initial_run_dict = read_run_file(args.initial_run)
+
     try:
         for i, qid in enumerate(test_qids, start=1):
             query = queries[qid]
@@ -846,7 +866,18 @@ def main() -> None:
                 "w_run3": w_run3,
             }
 
-            cached_baseline = disk_cache.get("generate_runs_baseline", baseline_key)
+            if initial_run_dict is not None:
+                 # Bypass retrieval, use loaded run
+                 # We treat the loaded run as 'fused3' which is the candidate for reranking
+                 loaded_docs = initial_run_dict.get(qid, [])
+                 # Ensure k
+                 fused3 = ensure_k(loaded_docs, [], k=k)
+                 # Mock other runs to avoid breaking downstream logic if it refers to them
+                 run1_ranked = fused3
+                 fused2 = fused3
+                 cached_baseline = None # signal that we didn't search
+            else:
+                 cached_baseline = disk_cache.get("generate_runs_baseline", baseline_key)
             if cached_baseline is None:
                 rm3_art = retrieve(rm3, query, k=k)
                 pp_art = retrieve(spladepp, query, k=k)
