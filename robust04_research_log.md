@@ -234,6 +234,57 @@ We investigated additional methods from the provided course materials to diversi
   - Best SDM MAP: **0.2493** (`w_o=0.01`, `w_u=0.1`, `alpha=0.3`).
 - **Conclusion**: Very marginal gain (+0.0007). Computationally expensive in Python (token scanning) for minimal lift. Not viable for production Run 2.
 
+### Sequential Dependence Model (SDM) via Anserini `SdmQueryGenerator` + RM3 (k-fold CV)
+
+- **Goal**: Tune SDM and RM3 parameters in a more robust way (reduce overfitting on 50 judged queries) by using **k-fold CV**.
+- **Implementation**:
+  - Script: `tune_sdm_rm3_cv.py`
+  - Retrieval: Pyserini `LuceneSearcher.batch_search(..., query_generator=JSdmQueryGenerator(...))`
+  - Index: `robust04`
+  - BM25 fixed: `k1=0.9`, `b=0.4`
+  - Metric: MAP@1000 on judged qids 301–350
+- **Search space**:
+  - SDM:
+    - `orderWindowWeight ∈ {0.05, 0.10, 0.15, 0.20}`
+    - `unorderWindowWeight ∈ {0.05, 0.10, 0.15, 0.20}`
+    - `termWeight = 1 - order - unorder` (must be > 0)
+  - RM3:
+    - `fb_terms ∈ {10, 20, 40, 60}`
+    - `fb_docs ∈ {3, 5, 10, 20}`
+    - `oqw ∈ {0.2, 0.5, 0.8}`
+- **5-fold CV results**:
+  - CV test MAP mean: **0.2558**
+  - CV test MAP std: **0.0349**
+  - Fold selections:
+    - Fold 1: SDM `(0.75, 0.10, 0.15)`, RM3 `(20, 5, 0.50)` → test MAP **0.3065**
+    - Fold 2: SDM `(0.75, 0.10, 0.15)`, RM3 `(20, 5, 0.50)` → test MAP **0.2238**
+    - Fold 3: SDM `(0.75, 0.15, 0.10)`, RM3 `(20, 5, 0.50)` → test MAP **0.2259**
+    - Fold 4: SDM `(0.75, 0.10, 0.15)`, RM3 `(60, 20, 0.50)` → test MAP **0.2892**
+    - Fold 5: SDM `(0.75, 0.20, 0.05)`, RM3 `(40, 5, 0.20)` → test MAP **0.2337**
+- **Majority-vote config (most stable across folds)**:
+  - SDM `(term=0.75, order=0.10, unorder=0.15)`
+  - RM3 `(fb_terms=20, fb_docs=5, oqw=0.50)`
+- **All-50 judged MAP for majority-vote config (train-on-all, not CV)**:
+  - MAP ≈ **0.2749**
+  - This is a small improvement over tuned RM3 baseline MAP ≈ **0.2719**.
+- **Next step**:
+  - A/B test: replace the RM3 component inside the strongest fused+MonoT5 pipeline with SDM+RM3 (same RM3 params, SDM query generator), and measure judged MAP impact.
+
+Candidate-stage A/B (strong fusion pipeline):
+
+- Script: `ab_sdm_in_strong_pipeline.py`
+- Setup:
+  - Fusion: RM3 + SPLADE++ + SPLADE-v3 + Dense (BGE)
+  - Weights: `W_RUN3 = [0.55, 0.10, 0.15, 0.20]`
+  - Dense query source: `orig_hyde`
+  - BM25: `k1=0.9`, `b=0.4`
+  - RM3: `fb_terms=20`, `fb_docs=5`, `oqw=0.5`
+  - SDM (swap only affects RM3 component): `(term=0.75, order=0.10, unorder=0.15)`
+- Result (judged qids 301–350, MAP@1000):
+  - Baseline fusion MAP: **0.3064**
+  - SDM+RM3 fusion MAP: **0.3080**
+  - Delta: **+0.0015**
+
 ### Neural Pseudo-Relevance Feedback (Neural PRF)
 
 - **Hypothesis**: Use a strong MonoT5 reranker to identify truly relevant documents in the top-N, then extract expansion terms from them to re-query the collection (Lecture 11 idea: better feedback docs = better query expansion).
