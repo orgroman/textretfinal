@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import json
+
 from cache_utils import DiskCache
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from pyserini.encode import SpladeQueryEncoder
+from pyserini.encode._splade import SpladeQueryEncoder
 from pyserini.search.lucene import LuceneHnswDenseSearcher, LuceneImpactSearcher, LuceneSearcher
 from pyserini.search.lucene import querybuilder
 from pyserini.analysis import Analyzer, get_lucene_analyzer
@@ -596,10 +598,81 @@ def read_queries_tsv(path: Path) -> Dict[str, str]:
     return queries
 
 
+def _clean_hyp_text(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if "explanation:" in low:
+        idx = low.index("explanation:")
+        s = s[:idx].strip()
+    for prefix in ["title:", "passage:"]:
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):].strip()
+    return s
+
+
+def load_qid_text_jsonl(path: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not path:
+        return out
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            qid = str(rec.get("qid", "")).strip()
+            text = _clean_hyp_text(str(rec.get("text", "")))
+            if not qid:
+                continue
+            if not text:
+                continue
+            out[qid] = text
+    return out
+
+
+def resolve_query_source(
+    *,
+    qid: str,
+    orig_query: str,
+    source: str,
+    hyde_docs: Dict[str, str],
+    hytitle_docs: Dict[str, str],
+) -> str:
+    src = str(source)
+    if src == "orig":
+        return orig_query
+    if src == "hyde":
+        return hyde_docs.get(qid, orig_query)
+    if src == "hytitle":
+        return hytitle_docs.get(qid, orig_query)
+    if src == "orig_hyde":
+        hyp = hyde_docs.get(qid, "")
+        return orig_query if not hyp else (orig_query + " " + hyp)
+    if src == "orig_hytitle":
+        hyp = hytitle_docs.get(qid, "")
+        return orig_query if not hyp else (orig_query + " " + hyp)
+    return orig_query
+
+
 def split_train_test_qids(all_qids: List[str]) -> Tuple[List[str], List[str]]:
     train = all_qids[:50]
     test = all_qids[50:]
     return train, test
+
+
+def _parse_weights_csv(s: str, expected_len: int, name: str) -> List[float]:
+    parts = [p.strip() for p in str(s).split(",") if p.strip()]
+    if len(parts) != int(expected_len):
+        raise ValueError(f"{name} must have {expected_len} comma-separated floats")
+    return [float(p) for p in parts]
 
 
 def minmax_norm(scores_dict: Dict[str, float]) -> Dict[str, float]:
@@ -695,11 +768,22 @@ def main() -> None:
     parser.add_argument("--out1", default="run_1.res")
     parser.add_argument("--out2", default="run_2.res")
     parser.add_argument("--out3", default="run_3.res")
+    parser.add_argument("--qid-set", default="test", choices=["test", "judged", "all"])
     parser.add_argument("--device", default=None)
     parser.add_argument("--cache-dir", default="/workspace/.cache")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--cache-refresh", action="store_true")
     parser.add_argument("--k", type=int, default=1000)
+
+    parser.add_argument("--w-run2", default=None)
+    parser.add_argument("--w-run3", default=None)
+
+    parser.add_argument("--hyde-jsonl", default=None)
+    parser.add_argument("--hytitle-jsonl", default=None)
+    parser.add_argument("--rm3-query-source", default="orig", choices=["orig", "hyde", "hytitle", "orig_hyde", "orig_hytitle"])
+    parser.add_argument("--spladepp-query-source", default="orig", choices=["orig", "hyde", "hytitle", "orig_hyde", "orig_hytitle"])
+    parser.add_argument("--spladev3-query-source", default="orig", choices=["orig", "hyde", "hytitle", "orig_hyde", "orig_hytitle"])
+    parser.add_argument("--dense-query-source", default="orig", choices=["orig", "hyde", "hytitle", "orig_hyde", "orig_hytitle"])
     parser.add_argument("--run2-method", default="fusion", choices=["fusion", "entity_lite", "entity_rerank", "f_itf", "f_rm3"])
     parser.add_argument("--run2-entity-fb-docs", type=int, default=10)
     parser.add_argument("--run2-entity-doc-max-chars", type=int, default=8000)
@@ -750,7 +834,15 @@ def main() -> None:
     queries_path = Path(args.queries)
     queries = read_queries_tsv(queries_path)
     all_qids = list(queries.keys())
-    _, test_qids = split_train_test_qids(all_qids)
+    train_qids, test_qids = split_train_test_qids(all_qids)
+
+    qid_set = str(args.qid_set)
+    if qid_set == "judged":
+        target_qids = train_qids
+    elif qid_set == "all":
+        target_qids = all_qids
+    else:
+        target_qids = test_qids
 
     device = args.device
     if device is None:
@@ -767,6 +859,28 @@ def main() -> None:
         raise ValueError("choose only one of --rerank3-monot5 or --rerank3-monot5-passages")
 
     k = args.k
+
+    need_hyde = any(
+        str(getattr(args, a)).find("hyde") != -1
+        for a in ["rm3_query_source", "spladepp_query_source", "spladev3_query_source", "dense_query_source"]
+    )
+    need_hytitle = any(
+        str(getattr(args, a)).find("hytitle") != -1
+        for a in ["rm3_query_source", "spladepp_query_source", "spladev3_query_source", "dense_query_source"]
+    )
+
+    hyde_docs: Dict[str, str] = {}
+    hytitle_docs: Dict[str, str] = {}
+    if need_hyde:
+        if not args.hyde_jsonl:
+            raise ValueError("HyDE query source selected but --hyde-jsonl not provided")
+        hyde_docs = load_qid_text_jsonl(str(args.hyde_jsonl))
+        print("Loaded HyDE docs", len(hyde_docs), "from", str(args.hyde_jsonl))
+    if need_hytitle:
+        if not args.hytitle_jsonl:
+            raise ValueError("HyTitle query source selected but --hytitle-jsonl not provided")
+        hytitle_docs = load_qid_text_jsonl(str(args.hytitle_jsonl))
+        print("Loaded HyTitle docs", len(hytitle_docs), "from", str(args.hytitle_jsonl))
 
     rm3 = LuceneSearcher.from_prebuilt_index("robust04")
     rm3.set_bm25(0.9, 0.4)
@@ -828,13 +942,59 @@ def main() -> None:
     w_run2 = [0.60, 0.25, 0.15]
     w_run3 = [0.55, 0.10, 0.15, 0.20]
 
+    if args.w_run2 is not None:
+        w_run2 = _parse_weights_csv(str(args.w_run2), 3, "--w-run2")
+    if args.w_run3 is not None:
+        w_run3 = _parse_weights_csv(str(args.w_run3), 4, "--w-run3")
+
     try:
-        for i, qid in enumerate(test_qids, start=1):
+        for i, qid in enumerate(target_qids, start=1):
             query = queries[qid]
+
+            q_rm3 = resolve_query_source(
+                qid=str(qid),
+                orig_query=query,
+                source=str(args.rm3_query_source),
+                hyde_docs=hyde_docs,
+                hytitle_docs=hytitle_docs,
+            )
+            q_pp = resolve_query_source(
+                qid=str(qid),
+                orig_query=query,
+                source=str(args.spladepp_query_source),
+                hyde_docs=hyde_docs,
+                hytitle_docs=hytitle_docs,
+            )
+            q_v3 = resolve_query_source(
+                qid=str(qid),
+                orig_query=query,
+                source=str(args.spladev3_query_source),
+                hyde_docs=hyde_docs,
+                hytitle_docs=hytitle_docs,
+            )
+            q_dense = resolve_query_source(
+                qid=str(qid),
+                orig_query=query,
+                source=str(args.dense_query_source),
+                hyde_docs=hyde_docs,
+                hytitle_docs=hytitle_docs,
+            )
 
             baseline_key = {
                 "qid": qid,
                 "query": query,
+                "query_sources": {
+                    "rm3": str(args.rm3_query_source),
+                    "spladepp": str(args.spladepp_query_source),
+                    "spladev3": str(args.spladev3_query_source),
+                    "dense": str(args.dense_query_source),
+                },
+                "query_texts": {
+                    "rm3": q_rm3,
+                    "spladepp": q_pp,
+                    "spladev3": q_v3,
+                    "dense": q_dense,
+                },
                 "k": int(k),
                 "rm3": {"index": "robust04", "bm25": [0.9, 0.4], "rm3": [20, 5, 0.5]},
                 "spladepp_index": "beir-v1.0.0-robust04.splade-pp-ed",
@@ -847,10 +1007,10 @@ def main() -> None:
 
             cached_baseline = disk_cache.get("generate_runs_baseline", baseline_key)
             if cached_baseline is None:
-                rm3_art = retrieve(rm3, query, k=k)
-                pp_art = retrieve(spladepp, query, k=k)
-                v3_art = retrieve(spladev3, query, k=k)
-                dense_art = retrieve(dense, query, k=k)
+                rm3_art = retrieve(rm3, q_rm3, k=k)
+                pp_art = retrieve(spladepp, q_pp, k=k)
+                v3_art = retrieve(spladev3, q_v3, k=k)
+                dense_art = retrieve(dense, q_dense, k=k)
 
                 run1_ranked = rm3_art.ranked[:k]
                 fallback_zero = [(d, 0.0) for d, _ in rm3_art.ranked]
@@ -931,7 +1091,7 @@ def main() -> None:
                         wt = (count / total_mass) * weight_scalar * scale_factor
                         if wt > 1e-4:
                             expansion_parts.append(f"\"{phrase}\"^{wt:.4f}")
-                             
+
                 expanded_query = query
                 if expansion_parts:
                     expanded_query = query + " " + " ".join(expansion_parts)
@@ -1287,7 +1447,7 @@ def main() -> None:
             run_3[qid] = fused3
 
             if i % 10 == 0:
-                print(f"processed {i}/{len(test_qids)} test queries")
+                print(f"processed {i}/{len(target_qids)} queries")
     finally:
         rm3.close()
         bm25.close()

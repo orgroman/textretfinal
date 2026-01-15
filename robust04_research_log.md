@@ -589,3 +589,31 @@ We encountered two major stability issues when implementing advanced LLM-based r
 
 *   **Listwise Reranking**: Running on judged set (301-350). Model: `castorini/rank_zephyr_7b_v1_full`.
 *   **HyDE**: Queued. Model: `HuggingFaceH4/zephyr-7b-beta`.
+
+### Experiment: Hypothetical Titles (HyTitle)
+
+*   **Hypothesis**: Generating a single "perfect title" (HyTitle) might be cleaner and less noisy/hallucinatory than generating a full 200-word HyDE passage.
+*   **Implementation**:
+    *   Prompt: "Generate a search query/title that would perfectly retrieve relevant documents..."
+    *   Model: `HuggingFaceH4/zephyr-7b-beta` (Same as HyDE).
+    *   Pipeline: HyTitle Gen -> Search (RM3/SPLADE/Dense) -> Fusion.
+*   **Results** (Judged Queries):
+    *   **MAP: 0.2639** (Baseline 0.2997).
+    *   **Finding**: Failed. Titles are **too sparse**. The dense retriever needs more "meat" (context, keywords) to match against the document embeddings effectively. HyDE passages (despite noise) provide that semantic surface area; titles do not.
+
+### Experiment: Fusion Optimizations (Improving the Ensemble)
+
+*   **Goal**: Maximize candidate quality (Recall@1K/nDCG@20) by feeding different query representations to different retrievers in the ensemble.
+*   **Variations Tested**:
+    1.  **Baseline**: All retrievers use Original Query.
+    2.  **HyDE-All**: All retrievers use HyDE Passage.
+    3.  **Dense-HyDE Hybrid**: 
+        *   **Lexical (RM3/SPLADE)**: Use Original Query (Precision).
+        *   **Dense (BGE)**: Use HyDE Passage (Semantic Expansion).
+*   **Results**:
+    *   **HyDE-All**: MAP 0.2046 (Disaster. Lexical models choke on Hallucinated terms).
+    *   **Dense-HyDE Hybrid**:
+        *   **MAP: 0.3059** (+0.6% over baseline).
+        *   **nDCG@20: 0.5013** (+1.8% over baseline).
+    *   **Recall@1K**: 0.7512 (Comparable to baseline).
+*   **Conclusion**: The **Dense-HyDE Hybrid** is the optimal retrieval-stage strategy. It leverages the strength of dense retrievers to handle "hallucinated context" while keeping lexical retrievers focused on the user's ground-truth keywords.

@@ -76,6 +76,20 @@ def mean_ndcg(run: Dict[str, List[str]], qrels: Dict[str, Dict[str, int]], k: in
     if not scores: return 0.0
     return sum(scores) / len(scores)
 
+def recall_at_k(docids: List[str], rels: Dict[str, int], k: int) -> float:
+    num_rel = sum(1 for r in rels.values() if r > 0)
+    if num_rel == 0: return 0.0
+    relevant_retrieved = sum(1 for d in docids[:k] if rels.get(d, 0) > 0)
+    return relevant_retrieved / num_rel
+
+def mean_recall(run: Dict[str, List[str]], qrels: Dict[str, Dict[str, int]], k: int) -> float:
+    scores = []
+    for qid in qrels:
+        if qid in run:
+            scores.append(recall_at_k(run[qid], qrels[qid], k))
+    if not scores: return 0.0
+    return sum(scores) / len(scores)
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python eval_and_verify.py <run_file1> <run_file2> ...")
@@ -95,10 +109,14 @@ def main():
         print(f"Judged queries in run: {len(run_judged)}")
         
         map_score = mean_ap(run_judged, qrels)
+        r100 = mean_recall(run_judged, qrels, k=100)
+        r1000 = mean_recall(run_judged, qrels, k=1000)
         ndcg_10 = mean_ndcg(run_judged, qrels, 10)
         ndcg_20 = mean_ndcg(run_judged, qrels, 20)
         
         print(f"MAP: {map_score:.4f}")
+        print(f"Recall@100: {r100:.4f}")
+        print(f"Recall@1000: {r1000:.4f}")
         print(f"nDCG@10: {ndcg_10:.4f}")
         print(f"nDCG@20: {ndcg_20:.4f}")
         print()
