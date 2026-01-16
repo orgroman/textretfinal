@@ -212,3 +212,4 @@ run_*_monot5*.res
 concat_md.py
 *.npy
 *.faiss
+parade_zenodo

@@ -1,0 +1,3 @@
+[submodule "RAG_Techniques"]
+	path = RAG_Techniques
+	url = https://github.com/NirDiamant/RAG_Techniques.git

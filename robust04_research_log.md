@@ -285,6 +285,26 @@ Candidate-stage A/B (strong fusion pipeline):
   - SDM+RM3 fusion MAP: **0.3080**
   - Delta: **+0.0015**
 
+End-to-end A/B (MonoT5 passage reranking on top of strong fusion):
+
+- Script: `ab_sdm_in_strong_pipeline.py` (same as above; run with `--rerank-monot5p`)
+- Setup:
+  - Candidate stage: same strong fusion as above
+  - Reranker: MonoT5 passage scoring
+    - `model=cramraj8/duqgen-monot5-3b-robust04-1k`
+    - `top_n=1000`, `alpha=0.3`
+    - `doc_max_chars=20000`, `max_passages=15`, `stride_chars=1200`, `passage_chars=1500`
+    - `agg=max`, `fp16=true`
+  - Baseline lexical component: RM3
+  - Variant lexical component: SDM+RM3 (swap only affects RM3 component)
+- Result (judged qids 301–350, MAP@1000):
+  - Baseline fusion+rerank MAP: **0.3788**
+  - SDM+RM3 fusion+rerank MAP: **0.3781**
+  - Delta: **-0.0006**
+- Conclusion:
+  - SDM gave a small improvement at the candidate stage, but did *not* improve end-to-end effectiveness after the (much stronger) MonoT5 passage reranker.
+  - For the final submission runs, we kept the simpler RM3 lexical component (more stable, fewer moving parts).
+
 ### Neural Pseudo-Relevance Feedback (Neural PRF)
 
 - **Hypothesis**: Use a strong MonoT5 reranker to identify truly relevant documents in the top-N, then extract expansion terms from them to re-query the collection (Lecture 11 idea: better feedback docs = better query expansion).
