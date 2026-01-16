@@ -213,3 +213,4 @@ concat_md.py
 *.npy
 *.faiss
 parade_zenodo
+triton_models
